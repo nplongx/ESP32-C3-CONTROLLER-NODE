@@ -89,16 +89,16 @@ pub fn init_mqtt_client(
 
     let topic_config = format!("AGITECH/{}/controller/config", device_id);
     let topic_command = format!("AGITECH/{}/controller/command", device_id);
-    // let topic_sensors = format!("AGITECH/{}/sensor/data", device_id);
+    let topic_sensors = format!("AGITECH/{}/sensor/data", device_id);
 
     info!("Subscribing topics:");
     info!("Config: {}", topic_config);
     info!("Command: {}", topic_command);
-    // info!("Sensors: {}", topic_sensors);
+    info!("Sensors: {}", topic_sensors);
 
     let topic_config_cb = topic_config.clone();
     let topic_command_cb = topic_command.clone();
-    // let topic_sensors_cb = topic_sensors.clone();
+    let topic_sensors_cb = topic_sensors.clone();
 
     // 1. Chuẩn bị thông tin LWT
     // Đảm bảo DEVICE_ID khớp với tên bạn đang dùng
@@ -174,43 +174,43 @@ pub fn init_mqtt_client(
                     }
                 }
                 // ---- SENSOR DATA ----
-                // else if topic_str == topic_sensors_cb {
-                //     debug!("📊 Processing SENSOR data snapshot");
-                //
-                //     match serde_json::from_slice::<IncomingSensorPayload>(data) {
-                //         Ok(payload) => {
-                //             if let Ok(mut sensors) = shared_sensor_data.write() {
-                //                 if let Some(t) = payload.temp {
-                //                     sensors.temp_value = t;
-                //                 }
-                //                 if let Some(e) = payload.ec {
-                //                     sensors.ec_value = e;
-                //                 }
-                //                 if let Some(p) = payload.ph {
-                //                     sensors.ph_value = p;
-                //                 }
-                //                 if let Some(w) = payload.water_level {
-                //                     sensors.water_level = w;
-                //                 }
-                //                 // Lưu ý: Ta KHÔNG chạm vào sensors.pump_status ở đây
-                //                 // Vì Node Cảm Biến không biết trạng thái bơm, Controller mới biết.
-                //
-                //                 info!(
-                //                     "🌱 Sensors Sync: Temp={:.1}°C | EC={:.2} | pH={:.2} | Level={:.1}cm",
-                //                     sensors.temp_value, sensors.ec_value, sensors.ph_value, sensors.water_level
-                //                 );
-                //             } else {
-                //                 error!("❌ Failed to acquire sensor write lock");
-                //             }
-                //         }
-                //         Err(e) => {
-                //             error!("❌ Sensor JSON parse error: {:?}", e);
-                //             if let Ok(payload_str) = std::str::from_utf8(data) {
-                //                 error!("Payload received: {}", payload_str);
-                //             }
-                //         }
-                //     }
-                // }
+                else if topic_str == topic_sensors_cb {
+                    debug!("📊 Processing SENSOR data snapshot");
+                    match serde_json::from_slice::<IncomingSensorPayload>(data) {
+                        Ok(payload) => {
+                            if let Ok(mut sensors) = shared_sensor_data.write() {
+                                if let Some(t) = payload.temp {
+                                    sensors.temp_value = t;
+                                }
+                                if let Some(e) = payload.ec {
+                                    sensors.ec_value = e;
+                                }
+                                if let Some(p) = payload.ph {
+                                    sensors.ph_value = p;
+                                }
+                                if let Some(w) = payload.water_level {
+                                    sensors.water_level = w;
+                                }
+
+                                sensors.last_update_ms = std::time::SystemTime::now()
+                                    .duration_since(std::time::UNIX_EPOCH)
+                                    .unwrap_or_default()
+                                    .as_millis()
+                                    as u64;
+
+                                info!(
+                                    "🌱 CẢM BIẾN (MQTT) | Temp: {:.1}°C | EC: {:.2} | pH: {:.2} | Level: {:.1}cm",
+                                    sensors.temp_value, sensors.ec_value, sensors.ph_value, sensors.water_level
+                                );
+                            } else {
+                                error!("❌ Failed to acquire sensor write lock");
+                            }
+                        }
+                        Err(e) => {
+                            error!("❌ Sensor JSON parse error: {:?}", e);
+                        }
+                    }
+                }
             }
             _ => {}
         }

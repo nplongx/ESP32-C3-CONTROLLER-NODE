@@ -250,6 +250,9 @@ fn main() -> anyhow::Result<()> {
     // ===============================
     // 5. MAIN EVENT LOOP (MQTT)
     // ===============================
+    // ===============================
+    // 5. MAIN EVENT LOOP (MQTT)
+    // ===============================
     let mut mqtt_client: Option<EspMqttClient> = None;
     let mut is_mqtt_connected = false;
 
@@ -257,6 +260,7 @@ fn main() -> anyhow::Result<()> {
 
     let mut last_sensor_publish = std::time::Instant::now();
     let mut force_publish_next = false; 
+    let mut last_config_hash = String::new(); // Dùng để check thay đổi cấu hình
 
     loop {
         if let Ok(state) = conn_rx.try_recv() {
@@ -286,10 +290,12 @@ fn main() -> anyhow::Result<()> {
                         let topic_config = format!("AGITECH/{}/controller/config", DEVICE_ID);
                         let topic_command = format!("AGITECH/{}/controller/command", DEVICE_ID);
                         let topic_status = format!("AGITECH/{}/status", DEVICE_ID);
+                        let topic_sensors = format!("AGITECH/{}/sensor/data", DEVICE_ID);
                         
                         let _ = client.publish(&topic_status, QoS::AtLeastOnce, false, r#"{"online": true}"#.as_bytes());
                         let _ = client.subscribe(&topic_config, QoS::AtLeastOnce);
                         let _ = client.subscribe(&topic_command, QoS::AtLeastOnce);
+                        let _ = client.subscribe(&topic_sensors, QoS::AtLeastOnce); // Subscribe topic sensor mới mở khóa
                     }
                 }
                 ConnectionState::MqttDisconnected => {
@@ -300,8 +306,39 @@ fn main() -> anyhow::Result<()> {
         }
 
         if is_mqtt_connected {
-            let interval_ms = shared_config.read().unwrap().publish_interval;
+            let config = shared_config.read().unwrap().clone();
+            
+            // ---------------------------------------------------------
+            // 5.1 KIỂM TRA VÀ PUBLISH CONFIG XUỐNG SENSOR NODE
+            // ---------------------------------------------------------
+            let current_config_hash = format!(
+                "{}_{}_{}_{}_{}_{}_{}_{}",
+                config.ph_v7, config.ph_v4, config.ec_factor, config.ec_offset, 
+                config.temp_compensation_beta,
+                config.enable_ph_sensor, config.enable_ec_sensor, config.enable_temp_sensor
+            );
 
+            if current_config_hash != last_config_hash {
+                let config_json = format!(
+                    r#"{{"ph_v7":{:.1}, "ph_v4":{:.1}, "ec_f":{:.2}, "beta":{:.3}, "en_ph":{}, "en_ec":{}, "en_temp":{}, "en_water":{}, "ma_window":{}, "en_ec_tc":{}, "en_ph_tc":{}}}"#,
+                    config.ph_v7, config.ph_v4, config.ec_factor, config.temp_compensation_beta,
+                    config.enable_ph_sensor, config.enable_ec_sensor, config.enable_temp_sensor, config.enable_water_level_sensor, 
+                    config.moving_average_window, config.enable_ec_sensor, config.enable_ph_sensor
+                );
+                
+                if let Some(client) = mqtt_client.as_mut() {
+                    let topic_sensor_config = format!("AGITECH/{}/sensor/config", DEVICE_ID);
+                    // Dùng retain = true để Sensor Node nhận được config ngay khi vừa khởi động
+                    let _ = client.publish(&topic_sensor_config, QoS::AtLeastOnce, true, config_json.as_bytes());
+                    last_config_hash = current_config_hash;
+                    info!("🔄 Đã đồng bộ cấu hình xuống Sensor Node qua MQTT");
+                }
+            }
+
+            // ---------------------------------------------------------
+            // 5.2 PUBLISH DỮ LIỆU TỔNG HỢP LÊN APP
+            // ---------------------------------------------------------
+            let interval_ms = config.publish_interval;
             if force_publish_next || last_sensor_publish.elapsed().as_millis() as u64 >= interval_ms {
                 if let Some(client) = mqtt_client.as_mut() {
                     let sensors = shared_sensor_data.read().unwrap().clone();
@@ -325,6 +362,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
+        // FSM Payload
         if let Ok(payload) = fsm_rx.try_recv() {
             if is_mqtt_connected {
                 if let Some(client) = mqtt_client.as_mut() {
@@ -334,6 +372,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
+        // Dosing report
         if let Ok(report_json) = dosing_report_rx.try_recv() {
             if is_mqtt_connected {
                 if let Some(client) = mqtt_client.as_mut() {
@@ -343,16 +382,18 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
+        // Cập nhật Publish lệnh xuống Sensor Node (ví dụ fast sampling, continuous level)
         if let Ok(sensor_cmd_json) = sensor_cmd_rx.try_recv() {
             if sensor_cmd_json.contains("\"command\":\"force_publish\"") {
                 force_publish_next = true; 
-            } else if sensor_cmd_json.contains("\"state\": true") || sensor_cmd_json.contains("\"state\":true") {
-                fast_sampling_mode.store(true, Ordering::Relaxed);
-            } else {
-                fast_sampling_mode.store(false, Ordering::Relaxed);
+            } else if is_mqtt_connected {
+                // Publish lệnh điều khiển xuống Sensor Node
+                if let Some(client) = mqtt_client.as_mut() {
+                    let topic_sensor_cmd = format!("AGITECH/{}/sensor/command", DEVICE_ID);
+                    let _ = client.publish(&topic_sensor_cmd, QoS::AtLeastOnce, false, sensor_cmd_json.as_bytes());
+                }
             }
         }
 
         thread::sleep(Duration::from_millis(50)); 
-    }
-}
+    }}

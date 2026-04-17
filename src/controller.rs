@@ -313,230 +313,226 @@ pub fn start_fsm_control_loop(
     dosing_report_tx: Sender<String>,
     sensor_cmd_tx: Sender<String>,
 ) {
-    std::thread::spawn(move || {
-        let mut ctx = ControlContext::default();
-        let mut last_reported_state = "".to_string();
+    let mut ctx = ControlContext::default();
+    let mut last_reported_state = "".to_string();
 
-        let mut nvs = EspNvs::new(nvs_partition, "agitech", true).ok();
-        let current_time_on_boot = get_current_time_sec();
-        ctx.last_water_change_time = nvs
-            .as_mut()
-            .and_then(|flash| flash.get_u64("last_w_change").unwrap_or(None))
-            .unwrap_or_else(|| {
-                if let Some(flash) = nvs.as_mut() {
-                    let _ = flash.set_u64("last_w_change", current_time_on_boot);
-                }
-                current_time_on_boot
-            });
-        ctx.last_mixing_start_sec = current_time_on_boot;
-
-        info!("🚀 Bắt đầu chạy Máy trạng thái (FSM) Đa luồng Hợp nhất...");
-
-        loop {
-            let config = shared_config.read().unwrap().clone();
-            let sensors = shared_sensors.read().unwrap().clone();
-            let current_time_ms = get_current_time_ms();
-            let current_time_sec = current_time_ms / 1000;
-
-            // 🟢 NHẬN LỆNH & XỬ LÝ CƯỠNG CHẾ
-            let force_sync =
-                process_mqtt_commands(&cmd_rx, &config, &mut pump_ctrl, &mut ctx, current_time_ms);
-
-            let mut expired_pumps = Vec::new();
-            for (pump, &finish_time) in &ctx.manual_timeouts {
-                if current_time_ms >= finish_time {
-                    expired_pumps.push(pump.clone());
-                }
+    let mut nvs = EspNvs::new(nvs_partition, "agitech", true).ok();
+    let current_time_on_boot = get_current_time_sec();
+    ctx.last_water_change_time = nvs
+        .as_mut()
+        .and_then(|flash| flash.get_u64("last_w_change").unwrap_or(None))
+        .unwrap_or_else(|| {
+            if let Some(flash) = nvs.as_mut() {
+                let _ = flash.set_u64("last_w_change", current_time_on_boot);
             }
-            for pump in expired_pumps {
-                ctx.manual_timeouts.remove(&pump);
-                info!("⏱️ HẾT GIỜ (SAFE TIMEOUT): Tự động tắt bơm {}!", pump);
-                ctx.turn_off_pump(&pump, &mut pump_ctrl);
+            current_time_on_boot
+        });
+    ctx.last_mixing_start_sec = current_time_on_boot;
+
+    info!("🚀 Bắt đầu chạy Máy trạng thái (FSM) Đa luồng Hợp nhất...");
+
+    loop {
+        let config = shared_config.read().unwrap().clone();
+        let sensors = shared_sensors.read().unwrap().clone();
+        let current_time_ms = get_current_time_ms();
+        let current_time_sec = current_time_ms / 1000;
+
+        // 🟢 NHẬN LỆNH & XỬ LÝ CƯỠNG CHẾ
+        let force_sync =
+            process_mqtt_commands(&cmd_rx, &config, &mut pump_ctrl, &mut ctx, current_time_ms);
+
+        let mut expired_pumps = Vec::new();
+        for (pump, &finish_time) in &ctx.manual_timeouts {
+            if current_time_ms >= finish_time {
+                expired_pumps.push(pump.clone());
             }
+        }
+        for pump in expired_pumps {
+            ctx.manual_timeouts.remove(&pump);
+            info!("⏱️ HẾT GIỜ (SAFE TIMEOUT): Tự động tắt bơm {}!", pump);
+            ctx.turn_off_pump(&pump, &mut pump_ctrl);
+        }
 
-            let is_sensor_disconnected = sensors.last_update_ms != 0
-                && current_time_ms > sensors.last_update_ms
-                && (current_time_ms - sensors.last_update_ms) > 30_000;
+        // Đã thay thế phép trừ thành `.saturating_sub()` để tránh panic
+        let is_sensor_disconnected = sensors.last_update_ms != 0
+            && current_time_ms.saturating_sub(sensors.last_update_ms) > 30_000;
 
-            // 🟢 KIỂM TRA TRẠNG THÁI CƯỠNG CHẾ AN TOÀN
-            let is_safety_overridden = current_time_ms < ctx.safety_override_until;
+        // 🟢 KIỂM TRA TRẠNG THÁI CƯỠNG CHẾ AN TOÀN
+        let is_safety_overridden = current_time_ms < ctx.safety_override_until;
 
-            if is_sensor_disconnected && !is_safety_overridden {
-                if ctx.current_state != SystemState::EmergencyStop
-                    && !matches!(ctx.current_state, SystemState::SystemFault(_))
-                {
-                    error!("📡⏳ MẤT KẾT NỐI BOARD CẢM BIẾN! Dừng hệ thống.");
-                    ctx.stop_all_pumps(&mut pump_ctrl);
-                    ctx.current_state = SystemState::SystemFault("SENSOR_DISCONNECTED".to_string());
-                }
-                report_state_if_changed(&ctx.current_state, &mut last_reported_state, &fsm_mqtt_tx);
+        if is_sensor_disconnected && !is_safety_overridden {
+            if ctx.current_state != SystemState::EmergencyStop
+                && !matches!(ctx.current_state, SystemState::SystemFault(_))
+            {
+                error!("📡⏳ MẤT KẾT NỐI BOARD CẢM BIẾN! Dừng hệ thống.");
+                ctx.stop_all_pumps(&mut pump_ctrl);
+                ctx.current_state = SystemState::SystemFault("SENSOR_DISCONNECTED".to_string());
+            }
+            report_state_if_changed(&ctx.current_state, &mut last_reported_state, &fsm_mqtt_tx);
+        } else {
+            if ctx.check_and_update_noise(&sensors, &config)
+                && config.control_mode == ControlMode::Auto
+            {
+                // Bỏ qua nhịp này do nhiễu
             } else {
-                if ctx.check_and_update_noise(&sensors, &config)
-                    && config.control_mode == ControlMode::Auto
-                {
-                    // Bỏ qua nhịp này do nhiễu
-                } else {
-                    let is_water_critical = config.enable_water_level_sensor
-                        && (sensors.water_level < config.water_level_critical_min);
-                    let is_ec_out_of_bounds = config.enable_ec_sensor
-                        && (sensors.ec_value < config.min_ec_limit
-                            || sensors.ec_value > config.max_ec_limit);
-                    let is_ph_out_of_bounds = config.enable_ph_sensor
-                        && (sensors.ph_value < config.min_ph_limit
-                            || sensors.ph_value > config.max_ph_limit);
+                let is_water_critical = config.enable_water_level_sensor
+                    && (sensors.water_level < config.water_level_critical_min);
+                let is_ec_out_of_bounds = config.enable_ec_sensor
+                    && (sensors.ec_value < config.min_ec_limit
+                        || sensors.ec_value > config.max_ec_limit);
+                let is_ph_out_of_bounds = config.enable_ph_sensor
+                    && (sensors.ph_value < config.min_ph_limit
+                        || sensors.ph_value > config.max_ph_limit);
 
-                    let should_emergency_stop = config.emergency_shutdown
-                        || is_water_critical
-                        || is_ec_out_of_bounds
-                        || is_ph_out_of_bounds;
+                let should_emergency_stop = config.emergency_shutdown
+                    || is_water_critical
+                    || is_ec_out_of_bounds
+                    || is_ph_out_of_bounds;
 
-                    // 🟢 NẾU NGUY HIỂM VÀ KHÔNG BỊ CƯỠNG CHẾ -> NGẮT
-                    if should_emergency_stop && !is_safety_overridden {
-                        if ctx.current_state != SystemState::EmergencyStop {
-                            error!("⚠️ DỪNG KHẨN CẤP Toàn bộ hệ thống!");
-                            ctx.stop_all_pumps(&mut pump_ctrl);
-                            ctx.current_state = SystemState::EmergencyStop;
-                        }
-                    } else if !config.is_enabled {
-                        if ctx.current_state != SystemState::Monitoring {
-                            ctx.stop_all_pumps(&mut pump_ctrl);
-                            ctx.current_state = SystemState::Monitoring;
-                        }
-                    } else if ctx.current_state == SystemState::EmergencyStop {
-                        // 🟢 NẾU MÔI TRƯỜNG ĐÃ AN TOÀN LẠI (HOẶC BỊ CƯỠNG CHẾ) -> HỦY DỪNG KHẨN CẤP
-                        if !should_emergency_stop || is_safety_overridden {
-                            info!("✅ Hệ thống an toàn trở lại (hoặc đang Cưỡng chế).");
-                            ctx.current_state = SystemState::Monitoring;
-                        }
-                    } else if config.control_mode == ControlMode::Auto && !is_safety_overridden {
-                        // ==== LOGIC AUTO (Chỉ chạy khi không bị cưỡng chế) ====
-                        let is_hot = config.enable_temp_sensor
-                            && (sensors.temp_value >= config.misting_temp_threshold);
-                        let on_duration = if is_hot {
-                            config.high_temp_misting_on_duration_ms
-                        } else {
-                            config.misting_on_duration_ms
-                        };
-                        let off_duration = if is_hot {
-                            config.high_temp_misting_off_duration_ms
-                        } else {
-                            config.misting_off_duration_ms
-                        };
-
-                        if ctx.is_misting_active {
-                            if current_time_ms >= ctx.last_mist_toggle_time + on_duration {
-                                let _ = pump_ctrl.set_mist_valve(false);
-                                ctx.is_misting_active = false;
-                                ctx.last_mist_toggle_time = current_time_ms;
-                                ctx.pump_status.mist_valve = false;
-                            }
-                        } else {
-                            if current_time_ms >= ctx.last_mist_toggle_time + off_duration {
-                                let _ = pump_ctrl.set_mist_valve(true);
-                                ctx.is_misting_active = true;
-                                ctx.last_mist_toggle_time = current_time_ms;
-                                ctx.pump_status.mist_valve = true;
-                            }
-                        }
-
-                        if config.scheduled_mixing_interval_sec > 0
-                            && config.scheduled_mixing_duration_sec > 0
-                        {
-                            if ctx.is_scheduled_mixing_active {
-                                if current_time_sec
-                                    >= ctx.last_mixing_start_sec
-                                        + config.scheduled_mixing_duration_sec
-                                {
-                                    ctx.is_scheduled_mixing_active = false;
-                                }
-                            } else {
-                                if current_time_sec
-                                    >= ctx.last_mixing_start_sec
-                                        + config.scheduled_mixing_interval_sec
-                                {
-                                    ctx.is_scheduled_mixing_active = true;
-                                    ctx.last_mixing_start_sec = current_time_sec;
-                                }
-                            }
-                        } else {
-                            ctx.is_scheduled_mixing_active = false;
-                        }
-
-                        if !matches!(ctx.current_state, SystemState::SystemFault(_)) {
-                            run_auto_fsm(
-                                current_time_ms,
-                                &config,
-                                &sensors,
-                                &mut ctx,
-                                &mut pump_ctrl,
-                                &mut nvs,
-                                &dosing_report_tx,
-                            );
-                        }
-
-                        let needs_osaka = ctx.fsm_osaka_active
-                            || ctx.is_misting_active
-                            || ctx.is_scheduled_mixing_active;
-                        if needs_osaka {
-                            let target_pwm = if ctx.is_misting_active {
-                                config.osaka_misting_pwm_percent
-                            } else {
-                                config.osaka_mixing_pwm_percent
-                            };
-                            if !ctx.pump_status.osaka_pump {
-                                let _ = pump_ctrl.start_osaka_pump_soft(target_pwm);
-                                ctx.pump_status.osaka_pump = true;
-                                ctx.current_osaka_pwm = target_pwm;
-                            } else if ctx.current_osaka_pwm != target_pwm {
-                                let _ = pump_ctrl.set_osaka_pump_pwm(target_pwm);
-                                ctx.current_osaka_pwm = target_pwm;
-                            }
-                        } else {
-                            if ctx.pump_status.osaka_pump {
-                                let _ = pump_ctrl.set_osaka_pump_pwm(0);
-                                ctx.pump_status.osaka_pump = false;
-                                ctx.current_osaka_pwm = 0;
-                            }
-                        }
-                    } else if !matches!(
-                        ctx.current_state,
-                        SystemState::Monitoring | SystemState::SystemFault(_)
-                    ) {
-                        info!("Chuyển sang chế độ MANUAL.");
+                // 🟢 NẾU NGUY HIỂM VÀ KHÔNG BỊ CƯỠNG CHẾ -> NGẮT
+                if should_emergency_stop && !is_safety_overridden {
+                    if ctx.current_state != SystemState::EmergencyStop {
+                        error!("⚠️ DỪNG KHẨN CẤP Toàn bộ hệ thống!");
+                        ctx.stop_all_pumps(&mut pump_ctrl);
+                        ctx.current_state = SystemState::EmergencyStop;
+                    }
+                } else if !config.is_enabled {
+                    if ctx.current_state != SystemState::Monitoring {
                         ctx.stop_all_pumps(&mut pump_ctrl);
                         ctx.current_state = SystemState::Monitoring;
                     }
+                } else if ctx.current_state == SystemState::EmergencyStop {
+                    // 🟢 NẾU MÔI TRƯỜNG ĐÃ AN TOÀN LẠI (HOẶC BỊ CƯỠNG CHẾ) -> HỦY DỪNG KHẨN CẤP
+                    if !should_emergency_stop || is_safety_overridden {
+                        info!("✅ Hệ thống an toàn trở lại (hoặc đang Cưỡng chế).");
+                        ctx.current_state = SystemState::Monitoring;
+                    }
+                } else if config.control_mode == ControlMode::Auto && !is_safety_overridden {
+                    // ==== LOGIC AUTO (Chỉ chạy khi không bị cưỡng chế) ====
+                    let is_hot = config.enable_temp_sensor
+                        && (sensors.temp_value >= config.misting_temp_threshold);
+                    let on_duration = if is_hot {
+                        config.high_temp_misting_on_duration_ms
+                    } else {
+                        config.misting_on_duration_ms
+                    };
+                    let off_duration = if is_hot {
+                        config.high_temp_misting_off_duration_ms
+                    } else {
+                        config.misting_off_duration_ms
+                    };
+
+                    if ctx.is_misting_active {
+                        if current_time_ms >= ctx.last_mist_toggle_time + on_duration {
+                            let _ = pump_ctrl.set_mist_valve(false);
+                            ctx.is_misting_active = false;
+                            ctx.last_mist_toggle_time = current_time_ms;
+                            ctx.pump_status.mist_valve = false;
+                        }
+                    } else {
+                        if current_time_ms >= ctx.last_mist_toggle_time + off_duration {
+                            let _ = pump_ctrl.set_mist_valve(true);
+                            ctx.is_misting_active = true;
+                            ctx.last_mist_toggle_time = current_time_ms;
+                            ctx.pump_status.mist_valve = true;
+                        }
+                    }
+
+                    if config.scheduled_mixing_interval_sec > 0
+                        && config.scheduled_mixing_duration_sec > 0
+                    {
+                        if ctx.is_scheduled_mixing_active {
+                            if current_time_sec
+                                >= ctx.last_mixing_start_sec + config.scheduled_mixing_duration_sec
+                            {
+                                ctx.is_scheduled_mixing_active = false;
+                            }
+                        } else {
+                            if current_time_sec
+                                >= ctx.last_mixing_start_sec + config.scheduled_mixing_interval_sec
+                            {
+                                ctx.is_scheduled_mixing_active = true;
+                                ctx.last_mixing_start_sec = current_time_sec;
+                            }
+                        }
+                    } else {
+                        ctx.is_scheduled_mixing_active = false;
+                    }
+
+                    if !matches!(ctx.current_state, SystemState::SystemFault(_)) {
+                        run_auto_fsm(
+                            current_time_ms,
+                            &config,
+                            &sensors,
+                            &mut ctx,
+                            &mut pump_ctrl,
+                            &mut nvs,
+                            &dosing_report_tx,
+                        );
+                    }
+
+                    let needs_osaka = ctx.fsm_osaka_active
+                        || ctx.is_misting_active
+                        || ctx.is_scheduled_mixing_active;
+                    if needs_osaka {
+                        let target_pwm = if ctx.is_misting_active {
+                            config.osaka_misting_pwm_percent
+                        } else {
+                            config.osaka_mixing_pwm_percent
+                        };
+                        if !ctx.pump_status.osaka_pump {
+                            let _ = pump_ctrl.start_osaka_pump_soft(target_pwm);
+                            ctx.pump_status.osaka_pump = true;
+                            ctx.current_osaka_pwm = target_pwm;
+                        } else if ctx.current_osaka_pwm != target_pwm {
+                            let _ = pump_ctrl.set_osaka_pump_pwm(target_pwm);
+                            ctx.current_osaka_pwm = target_pwm;
+                        }
+                    } else {
+                        if ctx.pump_status.osaka_pump {
+                            let _ = pump_ctrl.set_osaka_pump_pwm(0);
+                            ctx.pump_status.osaka_pump = false;
+                            ctx.current_osaka_pwm = 0;
+                        }
+                    }
+                } else if !matches!(
+                    ctx.current_state,
+                    SystemState::Monitoring | SystemState::SystemFault(_)
+                ) {
+                    info!("Chuyển sang chế độ MANUAL.");
+                    ctx.stop_all_pumps(&mut pump_ctrl);
+                    ctx.current_state = SystemState::Monitoring;
                 }
             }
-
-            let needs_continuous = matches!(
-                ctx.current_state,
-                SystemState::WaterRefilling { .. } | SystemState::WaterDraining { .. }
-            );
-            if needs_continuous != ctx.last_continuous_level {
-                let payload = format!(
-                    r#"{{"command":"continuous_level", "state": {}}}"#,
-                    needs_continuous
-                );
-                let _ = sensor_cmd_tx.send(payload);
-                ctx.last_continuous_level = needs_continuous;
-            }
-
-            report_state_if_changed(&ctx.current_state, &mut last_reported_state, &fsm_mqtt_tx);
-
-            if let Ok(mut sensors_lock) = shared_sensors.write() {
-                sensors_lock.pump_status = ctx.pump_status.clone();
-            }
-
-            if force_sync {
-                last_reported_state = "".to_string();
-                let _ = sensor_cmd_tx.send(r#"{"command":"force_publish"}"#.to_string());
-                info!("⚡ Đã ép luồng chính Publish trạng thái bơm mới nhất lên App!");
-            }
-
-            std::thread::sleep(Duration::from_millis(100));
         }
-    });
+
+        let needs_continuous = matches!(
+            ctx.current_state,
+            SystemState::WaterRefilling { .. } | SystemState::WaterDraining { .. }
+        );
+        if needs_continuous != ctx.last_continuous_level {
+            let payload = format!(
+                r#"{{"command":"continuous_level", "state": {}}}"#,
+                needs_continuous
+            );
+            let _ = sensor_cmd_tx.send(payload);
+            ctx.last_continuous_level = needs_continuous;
+        }
+
+        report_state_if_changed(&ctx.current_state, &mut last_reported_state, &fsm_mqtt_tx);
+
+        if let Ok(mut sensors_lock) = shared_sensors.write() {
+            sensors_lock.pump_status = ctx.pump_status.clone();
+        }
+
+        if force_sync {
+            last_reported_state = "".to_string();
+            let _ = sensor_cmd_tx.send(r#"{"command":"force_publish"}"#.to_string());
+            info!("⚡ Đã ép luồng chính Publish trạng thái bơm mới nhất lên App!");
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn report_state_if_changed(
@@ -704,7 +700,6 @@ fn process_mqtt_commands(
     force_sync
 }
 
-// ... HÀM run_auto_fsm GIỮ NGUYÊN BÊN DƯỚI ...
 fn run_auto_fsm(
     current_time_ms: u64,
     config: &DeviceConfig,
@@ -724,10 +719,11 @@ fn run_auto_fsm(
         SystemState::Monitoring => {
             ctx.verify_sensor_ack(sensors, config);
 
+            // Đã thay thế phép trừ thành `.saturating_sub()`
             if config.enable_water_level_sensor
                 && config.scheduled_water_change_enabled
-                && (current_time_sec - ctx.last_water_change_time
-                    > config.water_change_interval_sec)
+                && current_time_sec.saturating_sub(ctx.last_water_change_time)
+                    > config.water_change_interval_sec
             {
                 let target = (sensors.water_level - config.scheduled_drain_amount_cm)
                     .max(config.water_level_min);
@@ -876,8 +872,10 @@ fn run_auto_fsm(
             target_level,
             start_time,
         } => {
+            // Đã thay thế phép trừ thành `.saturating_sub()`
             if sensors.water_level >= target_level
-                || (current_time_ms - start_time) > (config.max_refill_duration_sec as u64 * 1000)
+                || current_time_ms.saturating_sub(start_time)
+                    > (config.max_refill_duration_sec as u64 * 1000)
             {
                 let _ = pump_ctrl.set_water_pump(WaterDirection::Stop);
                 ctx.pump_status.water_pump_in = false;
@@ -893,8 +891,10 @@ fn run_auto_fsm(
             target_level,
             start_time,
         } => {
+            // Đã thay thế phép trừ thành `.saturating_sub()`
             if sensors.water_level <= target_level
-                || (current_time_ms - start_time) > (config.max_drain_duration_sec as u64 * 1000)
+                || current_time_ms.saturating_sub(start_time)
+                    > (config.max_drain_duration_sec as u64 * 1000)
             {
                 let _ = pump_ctrl.set_water_pump(WaterDirection::Stop);
                 ctx.pump_status.water_pump_in = false;

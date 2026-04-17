@@ -84,6 +84,8 @@ pub struct DeviceConfig {
     pub enable_ph_sensor: bool,
     pub enable_water_level_sensor: bool,
     pub enable_temp_sensor: bool,
+    pub enable_ec_tc: bool,
+    pub enable_ph_tc: bool,
 
     // 6. THÔNG SỐ LOCAL CỦA ESP32 (Backend không có cũng không sao)
     pub dosing_pwm_percent: u32,
@@ -167,6 +169,9 @@ impl Default for DeviceConfig {
             enable_ph_sensor: true,
             enable_water_level_sensor: true,
             enable_temp_sensor: true,
+
+            enable_ec_tc: true,
+            enable_ph_tc: true,
 
             dosing_pwm_percent: 50,
             osaka_mixing_pwm_percent: 60,
