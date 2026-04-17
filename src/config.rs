@@ -94,6 +94,11 @@ pub struct DeviceConfig {
     pub misting_temp_threshold: f32,
     pub high_temp_misting_on_duration_ms: u64,
     pub high_temp_misting_off_duration_ms: u64,
+
+    pub scheduled_dosing_enabled: bool,     // Cờ bật/tắt
+    pub scheduled_dosing_interval_sec: u64, // Chu kỳ bơm (giây)
+    pub scheduled_dose_a_ml: f32,           // Liều lượng bơm A (ml)
+    pub scheduled_dose_b_ml: f32,           // Liều lượng bơm B (ml)
 }
 
 impl Default for DeviceConfig {
@@ -179,6 +184,11 @@ impl Default for DeviceConfig {
             misting_temp_threshold: 30.0,
             high_temp_misting_on_duration_ms: 15000,
             high_temp_misting_off_duration_ms: 60000,
+
+            scheduled_dosing_enabled: false,
+            scheduled_dosing_interval_sec: 86400, // 1 Ngày
+            scheduled_dose_a_ml: 10.0,
+            scheduled_dose_b_ml: 10.0,
         }
     }
 }
