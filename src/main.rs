@@ -290,7 +290,7 @@ fn main() -> anyhow::Result<()> {
                         let topic_config = format!("AGITECH/{}/controller/config", DEVICE_ID);
                         let topic_command = format!("AGITECH/{}/controller/command", DEVICE_ID);
                         let topic_status = format!("AGITECH/{}/status", DEVICE_ID);
-                        let topic_sensors = format!("AGITECH/{}/sensor/data", DEVICE_ID);
+                        let topic_sensors = format!("AGITECH/{}/sensor", DEVICE_ID);
                         
                         let _ = client.publish(&topic_status, QoS::AtLeastOnce, false, r#"{"online": true}"#.as_bytes());
                         let _ = client.subscribe(&topic_config, QoS::AtLeastOnce);
@@ -327,7 +327,7 @@ fn main() -> anyhow::Result<()> {
                 );
                 
                 if let Some(client) = mqtt_client.as_mut() {
-                    let topic_sensor_config = format!("AGITECH/{}/internal/config", DEVICE_ID);
+                    let topic_sensor_config = format!("AGITECH/{}/sensor/config", DEVICE_ID);
                     // Dùng retain = true để Sensor Node nhận được config ngay khi vừa khởi động
                     let _ = client.publish(&topic_sensor_config, QoS::AtLeastOnce, true, config_json.as_bytes());
                     last_config_hash = current_config_hash;
