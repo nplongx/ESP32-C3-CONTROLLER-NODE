@@ -290,7 +290,7 @@ fn main() -> anyhow::Result<()> {
                         let topic_config = format!("AGITECH/{}/controller/config", DEVICE_ID);
                         let topic_command = format!("AGITECH/{}/controller/command", DEVICE_ID);
                         let topic_status = format!("AGITECH/{}/status", DEVICE_ID);
-                        let topic_sensors = format!("AGITECH/{}/sensor", DEVICE_ID);
+                        let topic_sensors = format!("AGITECH/{}/sensors", DEVICE_ID);
                         
                         let _ = client.publish(&topic_status, QoS::AtLeastOnce, false, r#"{"online": true}"#.as_bytes());
                         let _ = client.subscribe(&topic_config, QoS::AtLeastOnce);
@@ -302,63 +302,6 @@ fn main() -> anyhow::Result<()> {
                     warn!("📡 MQTT Client: MẤT KẾT NỐI");
                     is_mqtt_connected = false;
                 }
-            }
-        }
-
-        if is_mqtt_connected {
-            let config = shared_config.read().unwrap().clone();
-            
-            // ---------------------------------------------------------
-            // 5.1 KIỂM TRA VÀ PUBLISH CONFIG XUỐNG SENSOR NODE
-            // ---------------------------------------------------------
-            let current_config_hash = format!(
-                "{}_{}_{}_{}_{}_{}_{}_{}",
-                config.ph_v7, config.ph_v4, config.ec_factor, config.ec_offset, 
-                config.temp_compensation_beta,
-                config.enable_ph_sensor, config.enable_ec_sensor, config.enable_temp_sensor
-            );
-
-            if current_config_hash != last_config_hash {
-                let config_json = format!(
-                    r#"{{"ph_v7":{:.1}, "ph_v4":{:.1}, "ec_f":{:.2}, "beta":{:.3}, "en_ph":{}, "en_ec":{}, "en_temp":{}, "en_water":{}, "ma_window":{}, "en_ec_tc":{}, "en_ph_tc":{}}}"#,
-                    config.ph_v7, config.ph_v4, config.ec_factor, config.temp_compensation_beta,
-                    config.enable_ph_sensor, config.enable_ec_sensor, config.enable_temp_sensor, config.enable_water_level_sensor, 
-                    config.moving_average_window, config.enable_ec_sensor, config.enable_ph_sensor
-                );
-                
-                if let Some(client) = mqtt_client.as_mut() {
-                    let topic_sensor_config = format!("AGITECH/{}/sensor/config", DEVICE_ID);
-                    // Dùng retain = true để Sensor Node nhận được config ngay khi vừa khởi động
-                    let _ = client.publish(&topic_sensor_config, QoS::AtLeastOnce, true, config_json.as_bytes());
-                    last_config_hash = current_config_hash;
-                    info!("🔄 Đã đồng bộ cấu hình xuống Sensor Node qua MQTT");
-                }
-            }
-
-            // ---------------------------------------------------------
-            // 5.2 PUBLISH DỮ LIỆU TỔNG HỢP LÊN APP
-            // ---------------------------------------------------------
-            let interval_ms = config.publish_interval;
-            if force_publish_next || last_sensor_publish.elapsed().as_millis() as u64 >= interval_ms {
-                if let Some(client) = mqtt_client.as_mut() {
-                    let sensors = shared_sensor_data.read().unwrap().clone();
-                    let current_ms = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_millis() as u64;
-
-                    let pumps = &sensors.pump_status;
-                    let payload = format!(
-                        r#"{{"device_id":"{}", "temp_value":{:.1}, "ec_value":{:.2}, "ph_value":{:.2}, "water_level":{:.1}, "pump_status": {{"pump_a":{}, "pump_b":{}, "ph_up":{}, "ph_down":{}, "osaka_pump":{}, "water_pump_in":{}, "water_pump_out":{}, "mist_valve":{}}}, "timestamp_ms":{}}}"#,
-                        DEVICE_ID, sensors.temp_value, sensors.ec_value, sensors.ph_value, sensors.water_level,
-                        pumps.pump_a, pumps.pump_b, pumps.ph_up, pumps.ph_down, pumps.osaka_pump, pumps.water_pump_in, pumps.water_pump_out, pumps.mist_valve, current_ms
-                    );
-
-                    let topic = format!("AGITECH/{}/sensors", DEVICE_ID);
-                    let _ = client.publish(&topic, QoS::AtMostOnce, false, payload.as_bytes());
-                }
-                last_sensor_publish = std::time::Instant::now();
-                force_publish_next = false; 
             }
         }
 

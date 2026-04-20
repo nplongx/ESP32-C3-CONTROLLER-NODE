@@ -89,7 +89,7 @@ pub fn init_mqtt_client(
 
     let topic_config = format!("AGITECH/{}/controller/config", device_id);
     let topic_command = format!("AGITECH/{}/controller/command", device_id);
-    let topic_sensors = format!("AGITECH/{}/sensor/data", device_id);
+    let topic_sensors = format!("AGITECH/{}/sensors", device_id);
 
     info!("Subscribing topics:");
     info!("Config: {}", topic_config);
