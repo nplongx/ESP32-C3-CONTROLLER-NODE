@@ -20,12 +20,12 @@ mod config;
 mod controller;
 mod mqtt;
 mod pump;
-mod sensors; 
+mod sensors;
 
+use crate::controller::{start_fsm_control_loop, SystemState};
 use config::create_shared_config;
 use mqtt::{create_shared_sensor_data, ConnectionState};
 use pump::PumpController;
-use crate::controller::{start_fsm_control_loop, SystemState};
 
 const WIFI_SSID: &str = "Huynh Hong";
 const WIFI_PASS: &str = "123443215";
@@ -60,7 +60,7 @@ fn main() -> anyhow::Result<()> {
     // 1. KHỞI TẠO BƠM VÀ VAN (Map lại chân cho ESP32-C3)
     // ===============================
     // LƯU Ý: Không dùng GPIO 11-17 trên ESP32-C3 (Dành cho Flash nội bộ)
-    
+
     let valve_mist = PinDriver::output(peripherals.pins.gpio10)?;
     let osaka_en = PinDriver::output(peripherals.pins.gpio0)?;
 
@@ -69,124 +69,43 @@ fn main() -> anyhow::Result<()> {
     let water_pump_out = PinDriver::output(peripherals.pins.gpio2)?;
 
     // Các bơm/động cơ dùng PWM (ESP32-C3 có 6 kênh LEDC từ 0 đến 5)
-    let osaka_rpwm = LedcDriver::new(peripherals.ledc.channel0, timer_driver.clone(), peripherals.pins.gpio3)?;
-    let pump_a = LedcDriver::new(peripherals.ledc.channel1, timer_driver.clone(), peripherals.pins.gpio6)?;
-    let pump_b = LedcDriver::new(peripherals.ledc.channel2, timer_driver.clone(), peripherals.pins.gpio7)?;
-    let pump_ph_up = LedcDriver::new(peripherals.ledc.channel3, timer_driver.clone(), peripherals.pins.gpio8)?;
-    let pump_ph_down = LedcDriver::new(peripherals.ledc.channel4, timer_driver.clone(), peripherals.pins.gpio21)?;
-
-    let pump_controller = PumpController::new(
-        pump_a, pump_b, pump_ph_up, pump_ph_down,
-        valve_mist, water_pump_in, water_pump_out, osaka_en, osaka_rpwm,
+    let osaka_rpwm = LedcDriver::new(
+        peripherals.ledc.channel0,
+        timer_driver.clone(),
+        peripherals.pins.gpio3,
+    )?;
+    let pump_a = LedcDriver::new(
+        peripherals.ledc.channel1,
+        timer_driver.clone(),
+        peripherals.pins.gpio6,
+    )?;
+    let pump_b = LedcDriver::new(
+        peripherals.ledc.channel2,
+        timer_driver.clone(),
+        peripherals.pins.gpio7,
+    )?;
+    let pump_ph_up = LedcDriver::new(
+        peripherals.ledc.channel3,
+        timer_driver.clone(),
+        peripherals.pins.gpio8,
+    )?;
+    let pump_ph_down = LedcDriver::new(
+        peripherals.ledc.channel4,
+        timer_driver.clone(),
+        peripherals.pins.gpio21,
     )?;
 
-    // ===============================
-    // 2. KHỞI TẠO LUỒNG UART ĐỌC CẢM BIẾN TỪ ESP32-C3 SENSOR NODE
-    // ===============================
-    info!("🔌 Chuẩn bị giao tiếp UART với mạch ESP32-C3 Sensor Node...");
-
-    let uart_tx = peripherals.pins.gpio4; 
-    let uart_rx = peripherals.pins.gpio5; 
-    let uart_port = peripherals.uart1;
-
-    let shared_sensor_data_clone = shared_sensor_data.clone();
-    let shared_config_clone = shared_config.clone();
-
-    let fast_sampling_mode = Arc::new(AtomicBool::new(false));
-    let fast_sampling_clone = fast_sampling_mode.clone();
-
-    std::thread::Builder::new()
-        .stack_size(8192)
-        .name("sensor_uart_thread".to_string())
-        .spawn(move || {
-            let uart_config = UartConfig::new().baudrate(115200.into());
-            let uart = UartDriver::new(
-                uart_port,
-                uart_tx,
-                uart_rx,
-                Option::<esp_idf_hal::gpio::AnyIOPin>::None,
-                Option::<esp_idf_hal::gpio::AnyIOPin>::None,
-                &uart_config,
-            ).expect("❌ Lỗi khởi tạo UART1");
-
-            let mut buf = [0u8; 128];
-            let mut line_buffer = String::new();
-            let mut last_config_hash = String::new();
-
-            info!("🔬 Đang lắng nghe Cảm biến qua UART...");
-
-            loop {
-                // 1. GỬI CONFIG XUỐNG ESP32-C3 NẾU CÓ THAY ĐỔI
-                let config = shared_config_clone.read().unwrap().clone();
-
-                let current_config_hash = format!(
-                    "{}_{}_{}_{}_{}_{}_{}_{}",
-                    config.ph_v7, config.ph_v4, config.ec_factor, config.ec_offset, 
-                    config.temp_compensation_beta,
-                    config.enable_ph_sensor, config.enable_ec_sensor, config.enable_temp_sensor
-                );
-
-                if current_config_hash != last_config_hash {
-                    let config_json = format!(
-                        r#"{{"ph_v7":{:.1}, "ph_v4":{:.1}, "ec_f":{:.2}, "beta":{:.3}, "en_ph":{}, "en_ec":{}, "en_temp":{}, "en_water":{}, "ma_window":{}}}"#,
-                        config.ph_v7, config.ph_v4, config.ec_factor, config.temp_compensation_beta,
-                        config.enable_ph_sensor, config.enable_ec_sensor, config.enable_temp_sensor, config.enable_water_level_sensor, 
-                        config.moving_average_window
-                    );
-                    
-                    let payload = format!("{}\n", config_json);
-                    if let Err(e) = uart.write(payload.as_bytes()) {
-                        error!("⚠️ Lỗi gửi UART config: {:?}", e);
-                    } else {
-                        last_config_hash = current_config_hash;
-                        info!("🔄 Đã đồng bộ cấu hình & trạng thái cảm biến xuống Node");
-                    }
-                }
-
-                // 2. LẮNG NGHE DỮ LIỆU TỪ SENSOR NODE
-                match uart.read(&mut buf, 50) { 
-                    Ok(bytes_read) if bytes_read > 0 => {
-                        let chunk = String::from_utf8_lossy(&buf[..bytes_read]);
-                        for c in chunk.chars() {
-                            if c == '\n' {
-                                let trimmed = line_buffer.trim();
-                                if !trimmed.is_empty() && trimmed.starts_with('{') {
-                                    match serde_json::from_str::<serde_json::Value>(trimmed) {
-                                        Ok(json_data) => {
-                                            let mut data = shared_sensor_data_clone.write().unwrap();
-                                            
-                                            if let Some(t) = json_data["temp"].as_f64() { data.temp_value = t as f32; }
-                                            if let Some(w) = json_data["water"].as_f64() { data.water_level = w as f32; }
-                                            if let Some(p) = json_data["ph"].as_f64() { data.ph_value = p as f32; }
-                                            if let Some(e) = json_data["ec"].as_f64() { data.ec_value = e as f32; }
-                                            
-                                            data.last_update_ms = std::time::SystemTime::now()
-                                                .duration_since(std::time::UNIX_EPOCH)
-                                                .unwrap_or_default()
-                                                .as_millis() as u64;
-
-                                            info!("📊 CẢM BIẾN | Temp: {:.1}°C | Water: {:.1}cm | pH: {:.2} | EC: {:.2}", 
-                                                data.temp_value, data.water_level, data.ph_value, data.ec_value);
-                                        }
-                                        Err(_) => {
-                                            warn!("⚠️ Bỏ qua chuỗi UART lỗi hoặc bị đứt đoạn: {}", trimmed);
-                                        }
-                                    }
-                                }
-                                line_buffer.clear();
-                            } else {
-                                line_buffer.push(c);
-                            }
-                        }
-                    }
-                    _ => {} 
-                }
-
-                let is_fast_mode = fast_sampling_clone.load(Ordering::Relaxed);
-                let delay_ms = if is_fast_mode { 100 } else { 500 };
-                thread::sleep(Duration::from_millis(delay_ms));
-            }
-        })?;
+    let pump_controller = PumpController::new(
+        pump_a,
+        pump_b,
+        pump_ph_up,
+        pump_ph_down,
+        valve_mist,
+        water_pump_in,
+        water_pump_out,
+        osaka_en,
+        osaka_rpwm,
+    )?;
 
     // ===============================
     // 3. KHỞI CHẠY BỘ ĐIỀU KHIỂN FSM
@@ -200,14 +119,14 @@ fn main() -> anyhow::Result<()> {
         .name("fsm_thread".to_string())
         .spawn(move || {
             start_fsm_control_loop(
-                fsm_config, 
-                fsm_sensor_data, 
-                pump_controller, 
+                fsm_config,
+                fsm_sensor_data,
+                pump_controller,
                 fsm_nvs,
-                cmd_rx, 
-                fsm_tx, 
-                dosing_report_tx, 
-                sensor_cmd_tx
+                cmd_rx,
+                fsm_tx,
+                dosing_report_tx,
+                sensor_cmd_tx,
             );
         })?;
 
@@ -230,7 +149,11 @@ fn main() -> anyhow::Result<()> {
         let mut was_connected = false;
         loop {
             let is_l2_connected = wifi.is_connected().unwrap_or(false);
-            let has_ip = wifi.sta_netif().get_ip_info().map(|info| !info.ip.is_unspecified()).unwrap_or(false);
+            let has_ip = wifi
+                .sta_netif()
+                .get_ip_info()
+                .map(|info| !info.ip.is_unspecified())
+                .unwrap_or(false);
             let is_fully_connected = is_l2_connected && has_ip;
 
             if is_fully_connected && !was_connected {
@@ -259,7 +182,7 @@ fn main() -> anyhow::Result<()> {
     info!("🔄 Đang chạy Main Event Loop...");
 
     let mut last_sensor_publish = std::time::Instant::now();
-    let mut force_publish_next = false; 
+    let mut force_publish_next = false;
     let mut last_config_hash = String::new(); // Dùng để check thay đổi cấu hình
 
     loop {
@@ -269,8 +192,11 @@ fn main() -> anyhow::Result<()> {
                     info!("🛜 Đã kết nối WiFi. Tiến hành khởi tạo MQTT...");
                     if mqtt_client.is_none() {
                         match mqtt::init_mqtt_client(
-                            MQTT_URL, shared_config.clone(), shared_sensor_data.clone(),
-                            cmd_tx.clone(), conn_tx.clone(),
+                            MQTT_URL,
+                            shared_config.clone(),
+                            shared_sensor_data.clone(),
+                            cmd_tx.clone(),
+                            conn_tx.clone(),
                         ) {
                             Ok(client) => mqtt_client = Some(client),
                             Err(e) => error!("❌ Lỗi khởi tạo MQTT: {:?}", e),
@@ -291,11 +217,17 @@ fn main() -> anyhow::Result<()> {
                         let topic_command = format!("AGITECH/{}/controller/command", DEVICE_ID);
                         let topic_status = format!("AGITECH/{}/status", DEVICE_ID);
                         let topic_sensors = format!("AGITECH/{}/sensors", DEVICE_ID);
-                        
-                        let _ = client.publish(&topic_status, QoS::AtLeastOnce, false, r#"{"online": true}"#.as_bytes());
+
+                        let _ = client.publish(
+                            &topic_status,
+                            QoS::AtLeastOnce,
+                            false,
+                            r#"{"online": true}"#.as_bytes(),
+                        );
                         let _ = client.subscribe(&topic_config, QoS::AtLeastOnce);
                         let _ = client.subscribe(&topic_command, QoS::AtLeastOnce);
-                        let _ = client.subscribe(&topic_sensors, QoS::AtLeastOnce); // Subscribe topic sensor mới mở khóa
+                        let _ = client.subscribe(&topic_sensors, QoS::AtLeastOnce);
+                        // Subscribe topic sensor mới mở khóa
                     }
                 }
                 ConnectionState::MqttDisconnected => {
@@ -328,15 +260,21 @@ fn main() -> anyhow::Result<()> {
         // Cập nhật Publish lệnh xuống Sensor Node (ví dụ fast sampling, continuous level)
         if let Ok(sensor_cmd_json) = sensor_cmd_rx.try_recv() {
             if sensor_cmd_json.contains("\"command\":\"force_publish\"") {
-                force_publish_next = true; 
+                force_publish_next = true;
             } else if is_mqtt_connected {
                 // Publish lệnh điều khiển xuống Sensor Node
                 if let Some(client) = mqtt_client.as_mut() {
                     let topic_sensor_cmd = format!("AGITECH/{}/sensor/command", DEVICE_ID);
-                    let _ = client.publish(&topic_sensor_cmd, QoS::AtLeastOnce, false, sensor_cmd_json.as_bytes());
+                    let _ = client.publish(
+                        &topic_sensor_cmd,
+                        QoS::AtLeastOnce,
+                        false,
+                        sensor_cmd_json.as_bytes(),
+                    );
                 }
             }
         }
 
-        thread::sleep(Duration::from_millis(50)); 
-    }}
+        thread::sleep(Duration::from_millis(50));
+    }
+}
