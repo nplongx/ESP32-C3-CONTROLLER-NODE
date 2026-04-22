@@ -6,6 +6,11 @@ use log::{debug, error, info, warn};
 use serde::{Deserialize, Serialize};
 use std::sync::{mpsc::Sender, Arc, RwLock};
 
+// 🟢 MỚI: Import thư viện hệ thống của ESP-IDF để lấy thông số phần cứng
+use esp_idf_sys::{
+    esp_get_free_heap_size, esp_timer_get_time, esp_wifi_sta_get_ap_info, wifi_ap_record_t,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum ConnectionState {
     WifiConnected,
@@ -14,7 +19,6 @@ pub enum ConnectionState {
     MqttDisconnected,
 }
 
-// 🟢 MỚI: Thêm cấu trúc trạng thái bơm (Sẽ lưu trữ và gửi lên DB Backend)
 #[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq)]
 pub struct PumpStatus {
     pub pump_a: bool,
@@ -27,6 +31,7 @@ pub struct PumpStatus {
     pub water_pump_out: bool,
 }
 
+// 🟢 CẬP NHẬT: Thêm các trường sức khỏe gửi từ Sensor Node
 #[derive(Debug, Deserialize)]
 pub struct IncomingSensorPayload {
     pub temp: Option<f32>,
@@ -34,6 +39,13 @@ pub struct IncomingSensorPayload {
     pub ph: Option<f32>,
     pub water_level: Option<f32>,
     pub timestamp_ms: Option<u64>,
+
+    // Các trường Device Health mới từ Sensor Node
+    pub rssi: Option<i32>,
+    pub free_heap: Option<u32>,
+    pub uptime: Option<u32>,
+    pub is_continuous: Option<bool>,
+    pub err_water: Option<bool>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -43,7 +55,6 @@ pub struct SensorData {
     pub temp_value: f32,
     pub water_level: f32,
     pub last_update_ms: u64,
-    // 🟢 MỚI: Lưu trữ trạng thái bơm
     #[serde(default)]
     pub pump_status: PumpStatus,
 }
@@ -56,7 +67,7 @@ impl Default for SensorData {
             temp_value: 25.0,
             water_level: 20.0,
             last_update_ms: 0,
-            pump_status: PumpStatus::default(), // Khởi tạo mặc định (Toàn bộ false)
+            pump_status: PumpStatus::default(),
         }
     }
 }
@@ -73,6 +84,34 @@ pub struct MqttCommandPayload {
     pub pump: String,
     pub duration_sec: Option<u64>,
     pub pwm: Option<u32>,
+}
+
+// 🟢 MỚI: Struct dùng để publish trạng thái sức khỏe của Controller
+#[derive(Debug, Serialize)]
+pub struct ControllerHealthPayload {
+    pub free_heap: u32,
+    pub uptime_sec: u64,
+    pub rssi: i8,
+    pub pump_status: PumpStatus,
+}
+
+// 🟢 MỚI: Các hàm tiện ích lấy thông số phần cứng
+pub fn get_free_heap() -> u32 {
+    unsafe { esp_get_free_heap_size() as u32 }
+}
+
+pub fn get_uptime_sec() -> u64 {
+    (unsafe { esp_timer_get_time() } / 1_000_000) as u64
+}
+
+pub fn get_wifi_rssi() -> i8 {
+    let mut ap_info: wifi_ap_record_t = Default::default();
+    let result = unsafe { esp_wifi_sta_get_ap_info(&mut ap_info) };
+    if result == 0 {
+        ap_info.rssi
+    } else {
+        0
+    }
 }
 
 pub fn init_mqtt_client(
@@ -101,7 +140,6 @@ pub fn init_mqtt_client(
     let topic_sensors_cb = topic_sensors.clone();
 
     // 1. Chuẩn bị thông tin LWT
-    // Đảm bảo DEVICE_ID khớp với tên bạn đang dùng
     let lwt_topic = format!("AGITECH/{}/status", device_id);
     let lwt_payload = r#"{"online": false}"#.as_bytes();
 
@@ -109,11 +147,10 @@ pub fn init_mqtt_client(
         topic: &lwt_topic,
         payload: lwt_payload,
         qos: QoS::AtLeastOnce,
-        retain: true, // Lưu lại trạng thái offline cho các client kết nối sau
+        retain: true,
     };
 
     // 2. Thêm LWT vào cấu hình MQTT
-
     let mqtt_config = MqttClientConfiguration {
         buffer_size: 4096,
         keep_alive_interval: Some(std::time::Duration::from_secs(15)),
@@ -198,9 +235,10 @@ pub fn init_mqtt_client(
                                     .as_millis()
                                     as u64;
 
+                                // In ra log bao gồm cả một số thông số sức khỏe (nếu có)
                                 info!(
-                                    "🌱 CẢM BIẾN (MQTT) | Temp: {:.1}°C | EC: {:.2} | pH: {:.2} | Level: {:.1}cm",
-                                    sensors.temp_value, sensors.ec_value, sensors.ph_value, sensors.water_level
+                                    "🌱 CẢM BIẾN | T: {:.1}°C | EC: {:.2} | pH: {:.2} | Lv: {:.1}cm | Sóng: {:?}dBm | Lỗi nước: {:?}",
+                                    sensors.temp_value, sensors.ec_value, sensors.ph_value, sensors.water_level, payload.rssi, payload.err_water
                                 );
                             } else {
                                 error!("❌ Failed to acquire sensor write lock");
@@ -220,3 +258,4 @@ pub fn init_mqtt_client(
 
     Ok(client)
 }
+

@@ -40,7 +40,7 @@ pub enum PendingDose {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SystemState {
     Monitoring,
-    EmergencyStop,
+    EmergencyStop(String), // 🟢 Cập nhật: Thêm String mang lý do lỗi
     SystemFault(String),
     WaterRefilling {
         target_level: f32,
@@ -98,7 +98,8 @@ impl SystemState {
     pub fn to_payload_string(&self) -> String {
         match self {
             SystemState::Monitoring => "Monitoring".to_string(),
-            SystemState::EmergencyStop => "EmergencyStop".to_string(),
+            // 🟢 Cập nhật: Gửi kèm lý do Emergency
+            SystemState::EmergencyStop(reason) => format!("EmergencyStop:{}", reason),
             SystemState::SystemFault(reason) => format!("SystemFault:{}", reason),
             SystemState::WaterRefilling { .. } => "WaterRefilling".to_string(),
             SystemState::WaterDraining { .. } => "WaterDraining".to_string(),
@@ -398,11 +399,10 @@ pub fn start_fsm_control_loop(
                 && current_time_ms > sensors.last_update_ms
                 && (current_time_ms - sensors.last_update_ms) > 30_000;
 
-            // 🟢 KIỂM TRA TRẠNG THÁI CƯỠNG CHẾ AN TOÀN
             let is_safety_overridden = current_time_ms < ctx.safety_override_until;
 
             if is_sensor_disconnected && !is_safety_overridden {
-                if ctx.current_state != SystemState::EmergencyStop
+                if !matches!(ctx.current_state, SystemState::EmergencyStop(_))
                     && !matches!(ctx.current_state, SystemState::SystemFault(_))
                 {
                     error!("📡⏳ MẤT KẾT NỐI BOARD CẢM BIẾN! Dừng hệ thống.");
@@ -425,24 +425,36 @@ pub fn start_fsm_control_loop(
                         && (sensors.ph_value < config.min_ph_limit
                             || sensors.ph_value > config.max_ph_limit);
 
-                    let should_emergency_stop = config.emergency_shutdown
-                        || is_water_critical
-                        || is_ec_out_of_bounds
-                        || is_ph_out_of_bounds;
+                    // 🟢 MỚI: Bóc tách lý do Emergency cụ thể
+                    let mut emergency_reason = String::new();
+                    if config.emergency_shutdown {
+                        emergency_reason = "MANUAL_STOP".to_string();
+                    } else if is_water_critical {
+                        emergency_reason = "WATER_CRITICAL".to_string();
+                    } else if is_ec_out_of_bounds {
+                        emergency_reason = "EC_OUT_OF_BOUNDS".to_string();
+                    } else if is_ph_out_of_bounds {
+                        emergency_reason = "PH_OUT_OF_BOUNDS".to_string();
+                    }
+
+                    let should_emergency_stop = !emergency_reason.is_empty();
 
                     // 🟢 NẾU NGUY HIỂM VÀ KHÔNG BỊ CƯỠNG CHẾ -> NGẮT
                     if should_emergency_stop && !is_safety_overridden {
-                        if ctx.current_state != SystemState::EmergencyStop {
-                            error!("⚠️ DỪNG KHẨN CẤP Toàn bộ hệ thống!");
+                        if !matches!(ctx.current_state, SystemState::EmergencyStop(_)) {
+                            error!(
+                                "⚠️ DỪNG KHẨN CẤP Toàn bộ hệ thống! Lý do: {}",
+                                emergency_reason
+                            );
                             ctx.stop_all_pumps(&mut pump_ctrl);
-                            ctx.current_state = SystemState::EmergencyStop;
+                            ctx.current_state = SystemState::EmergencyStop(emergency_reason);
                         }
                     } else if !config.is_enabled {
                         if ctx.current_state != SystemState::Monitoring {
                             ctx.stop_all_pumps(&mut pump_ctrl);
                             ctx.current_state = SystemState::Monitoring;
                         }
-                    } else if ctx.current_state == SystemState::EmergencyStop {
+                    } else if matches!(ctx.current_state, SystemState::EmergencyStop(_)) {
                         // 🟢 NẾU MÔI TRƯỜNG ĐÃ AN TOÀN LẠI (HOẶC BỊ CƯỠNG CHẾ) -> HỦY DỪNG KHẨN CẤP
                         if !should_emergency_stop || is_safety_overridden {
                             info!("✅ Hệ thống an toàn trở lại (hoặc đang Cưỡng chế).");
@@ -540,7 +552,9 @@ pub fn start_fsm_control_loop(
                         }
                     } else if !matches!(
                         ctx.current_state,
-                        SystemState::Monitoring | SystemState::SystemFault(_)
+                        SystemState::Monitoring
+                            | SystemState::SystemFault(_)
+                            | SystemState::EmergencyStop(_)
                     ) {
                         info!("Chuyển sang chế độ MANUAL.");
                         ctx.stop_all_pumps(&mut pump_ctrl);
@@ -604,6 +618,12 @@ fn process_mqtt_commands(
 ) -> bool {
     let mut force_sync = false;
 
+    // 🟢 MỚI: BỨC TƯỜNG LỬA CHẶN LỆNH NORMAL KHI EMERGENCY/FAULT
+    let is_emergency_state = matches!(
+        ctx.current_state,
+        SystemState::EmergencyStop(_) | SystemState::SystemFault(_)
+    );
+
     while let Ok(cmd) = cmd_rx.try_recv() {
         if cmd.action == "SYNC_STATUS" {
             force_sync = true;
@@ -635,6 +655,12 @@ fn process_mqtt_commands(
             || action_lower == "true"
             || action_lower == "1"
             || (is_set_pwm && cmd.pwm.unwrap_or(0) > 0);
+
+        // 🟢 BỨC TƯỜNG LỬA BẢO VỆ FSM: Chặn lệnh bật / set PWM thông thường
+        if is_emergency_state && is_on && !is_force_on {
+            warn!("❌ BLOCKED: Không thể điều khiển {} bình thường vì hệ thống đang Lỗi / EmergencyStop. Vui lòng dùng FORCE.", pump_name);
+            continue;
+        }
 
         if is_force_on {
             info!("⚠️ NGƯỜI DÙNG CƯỠNG CHẾ BẬT {}!", pump_name);
@@ -946,7 +972,6 @@ fn run_auto_fsm(
                 }
 
                 // 🟢 BÙ PH TỰ ĐỘNG
-                // 🟢 BÙ PH TỰ ĐỘNG
                 if config.enable_ph_sensor
                     && !is_dosing_active
                     && (sensors.ph_value - config.ph_target).abs() > config.ph_tolerance
@@ -966,7 +991,6 @@ fn run_auto_fsm(
                         };
                         let safe_pwm = config.dosing_pwm_percent.clamp(1, 100);
 
-                        // 🟢 MỚI: Lấy chính xác capacity của bơm pH Up hoặc pH Down
                         let base_capacity = if is_ph_up {
                             config.pump_ph_up_capacity_ml_per_sec
                         } else {
@@ -1268,6 +1292,7 @@ fn run_auto_fsm(
             }
         }
 
-        SystemState::EmergencyStop => {}
+        SystemState::EmergencyStop(_) => {} // Không làm gì cả, chờ user FORCE hoặc Reset lỗi
     }
 }
+

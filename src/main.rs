@@ -59,16 +59,12 @@ fn main() -> anyhow::Result<()> {
     // ===============================
     // 1. KHỞI TẠO BƠM VÀ VAN (Map lại chân cho ESP32-C3)
     // ===============================
-    // LƯU Ý: Không dùng GPIO 11-17 trên ESP32-C3 (Dành cho Flash nội bộ)
-
     let valve_mist = PinDriver::output(peripherals.pins.gpio10)?;
     let osaka_en = PinDriver::output(peripherals.pins.gpio0)?;
 
-    // Bơm nước vào ra chuyển sang Bật/Tắt (On/Off)
     let water_pump_in = PinDriver::output(peripherals.pins.gpio1)?;
     let water_pump_out = PinDriver::output(peripherals.pins.gpio2)?;
 
-    // Các bơm/động cơ dùng PWM (ESP32-C3 có 6 kênh LEDC từ 0 đến 5)
     let osaka_rpwm = LedcDriver::new(
         peripherals.ledc.channel0,
         timer_driver.clone(),
@@ -171,21 +167,21 @@ fn main() -> anyhow::Result<()> {
     });
 
     // ===============================
-    // 5. MAIN EVENT LOOP (MQTT)
-    // ===============================
-    // ===============================
-    // 5. MAIN EVENT LOOP (MQTT)
+    // 5. MAIN EVENT LOOP (MQTT & STATUS)
     // ===============================
     let mut mqtt_client: Option<EspMqttClient> = None;
     let mut is_mqtt_connected = false;
 
     info!("🔄 Đang chạy Main Event Loop...");
 
-    let mut last_sensor_publish = std::time::Instant::now();
     let mut force_publish_next = false;
-    let mut last_config_hash = String::new(); // Dùng để check thay đổi cấu hình
+    let mut last_config_hash = String::new();
+
+    // 🟢 MỚI: Biến lưu thời điểm cuối cùng gửi Health Status
+    let mut last_health_publish = std::time::Instant::now();
 
     loop {
+        // --- XỬ LÝ TRẠNG THÁI KẾT NỐI ---
         if let Ok(state) = conn_rx.try_recv() {
             match state {
                 ConnectionState::WifiConnected => {
@@ -221,13 +217,12 @@ fn main() -> anyhow::Result<()> {
                         let _ = client.publish(
                             &topic_status,
                             QoS::AtLeastOnce,
-                            false,
+                            true, // Retain = true để giữ trạng thái
                             r#"{"online": true}"#.as_bytes(),
                         );
                         let _ = client.subscribe(&topic_config, QoS::AtLeastOnce);
                         let _ = client.subscribe(&topic_command, QoS::AtLeastOnce);
                         let _ = client.subscribe(&topic_sensors, QoS::AtLeastOnce);
-                        // Subscribe topic sensor mới mở khóa
                     }
                 }
                 ConnectionState::MqttDisconnected => {
@@ -237,7 +232,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        // FSM Payload
+        // --- XỬ LÝ PAYLOAD TỪ FSM THREAD ---
         if let Ok(payload) = fsm_rx.try_recv() {
             if is_mqtt_connected {
                 if let Some(client) = mqtt_client.as_mut() {
@@ -247,7 +242,6 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        // Dosing report
         if let Ok(report_json) = dosing_report_rx.try_recv() {
             if is_mqtt_connected {
                 if let Some(client) = mqtt_client.as_mut() {
@@ -257,12 +251,10 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        // Cập nhật Publish lệnh xuống Sensor Node (ví dụ fast sampling, continuous level)
         if let Ok(sensor_cmd_json) = sensor_cmd_rx.try_recv() {
             if sensor_cmd_json.contains("\"command\":\"force_publish\"") {
                 force_publish_next = true;
             } else if is_mqtt_connected {
-                // Publish lệnh điều khiển xuống Sensor Node
                 if let Some(client) = mqtt_client.as_mut() {
                     let topic_sensor_cmd = format!("AGITECH/{}/sensor/command", DEVICE_ID);
                     let _ = client.publish(
@@ -275,6 +267,38 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
+        // ==========================================
+        // 🟢 MỚI: GỬI SỨC KHỎE THIẾT BỊ MỖI 10 GIÂY
+        // ==========================================
+        if is_mqtt_connected && last_health_publish.elapsed().as_secs() >= 10 {
+            last_health_publish = std::time::Instant::now();
+
+            if let Some(client) = mqtt_client.as_mut() {
+                // Đọc trạng thái bơm mới nhất từ shared struct
+                let current_pump_status = shared_sensor_data.read().unwrap().pump_status.clone();
+
+                // Tạo payload sức khỏe thiết bị
+                let health_payload = crate::mqtt::ControllerHealthPayload {
+                    free_heap: crate::mqtt::get_free_heap(),
+                    uptime_sec: crate::mqtt::get_uptime_sec(),
+                    rssi: crate::mqtt::get_wifi_rssi(),
+                    pump_status: current_pump_status,
+                };
+
+                if let Ok(json_string) = serde_json::to_string(&health_payload) {
+                    let topic_health = format!("AGITECH/{}/controller/status", DEVICE_ID);
+                    let _ = client.publish(
+                        &topic_health,
+                        QoS::AtMostOnce, // QoS 0 cho bản tin telemetry tần suất cao
+                        false,
+                        json_string.as_bytes(),
+                    );
+                }
+            }
+        }
+
+        // Nghỉ 50ms để nhường CPU cho các tác vụ khác (RTOS Task)
         thread::sleep(Duration::from_millis(50));
     }
 }
+
